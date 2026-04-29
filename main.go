@@ -9,6 +9,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/cilium/ebpf/link"
@@ -128,20 +130,47 @@ func main() {
 	<-stop
 }
 
-// 辅助函数：根据发行版查找 libpam 路径
+// findLibPAM 自动适配架构并动态查找 libpam 路径
 func findLibPAM() string {
-	paths := []string{
-		"/usr/lib/x86_64-linux-gnu/libpam.so.0", // Ubuntu/Debian
-		"/usr/lib64/libpam.so.0",                // CentOS/RHEL
-		"/lib/x86_64-linux-gnu/libpam.so.0",
-		"/lib64/libpam.so.0",
+	var searchPaths []string
+
+	// 1. 根据架构定义基础路径
+	arch := runtime.GOARCH
+	is64bit := strings.Contains(arch, "64")
+
+	if is64bit {
+		searchPaths = append(searchPaths,
+			"/usr/lib/x86_64-linux-gnu/libpam.so.0", // Debian/Ubuntu x64
+			"/usr/lib64/libpam.so.0",                // CentOS/RHEL x64
+			"/lib/x86_64-linux-gnu/libpam.so.0",
+			"/lib64/libpam.so.0",
+		)
 	}
-	for _, p := range paths {
+
+	// 针对 ARM64 的适配 (如果是国产操作系统或云服务器)
+	if arch == "arm64" {
+		searchPaths = append(searchPaths,
+			"/usr/lib/aarch64-linux-gnu/libpam.so.0",
+			"/lib/aarch64-linux-gnu/libpam.so.0",
+		)
+	}
+
+	// 2. 通用兜底路径
+	searchPaths = append(searchPaths,
+		"/usr/lib/libpam.so.0",
+		"/lib/libpam.so.0",
+	)
+
+	// 3. 执行探测
+	for _, p := range searchPaths {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
 	}
-	return "libpam.so.0" // 回退到系统查找
+
+	// 4. 最后的倔强：如果上面的都找不到，尝试让系统自己去找
+	// 这通常在用户手动指定了 LD_LIBRARY_PATH 时有用
+	return "libpam.so.0"
 }
 
 // ensureExecutable 检查并尝试为文件添加执行权限
