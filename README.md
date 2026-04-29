@@ -39,8 +39,8 @@
 
 仓库内提供：
 
-- [Dockerfile](/root/fail2ban-ebpf/Dockerfile:1)
-- [docker-compose.yml](/root/fail2ban-ebpf/docker-compose.yml:1)
+- [Dockerfile](/root/fail2ban-ebpf/Dockerfile)
+- [docker-compose.yml](/root/fail2ban-ebpf/docker-compose.yml)
 
 ### 启动
 
