@@ -10,6 +10,7 @@ char __license[] SEC("license") = "GPL";
 #define ETH_P_IP 0x0800
 #endif
 
+// blocked_ips的长度会在启动时根据config.yaml配置文件进行修改，这里的长度起个语法填充作用
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u32);

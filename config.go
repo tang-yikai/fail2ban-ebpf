@@ -33,7 +33,7 @@ func defaultConfig() Config {
 	cfg.Ban.Threshold = 3
 	cfg.Ban.WindowMinutes = 10
 	cfg.Ban.DurationMinutes = 1440
-	cfg.Ban.MaxBlockedIPs = 65536
+	cfg.Ban.MaxBlockedIPs = 262144
 	cfg.Log.File = "./fail2ban-ebpf.log"
 	return cfg
 }
