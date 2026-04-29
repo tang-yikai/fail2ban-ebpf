@@ -8,9 +8,19 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
+
+type sshmonPidCtx struct {
+	_             structs.HostLayout
+	RemoteIp      uint32
+	_             [4]byte
+	StartNs       uint64
+	AuthAttempted uint8
+	_             [7]byte
+}
 
 // loadSshmon returns the embedded CollectionSpec for sshmon.
 func loadSshmon() (*ebpf.CollectionSpec, error) {
@@ -66,13 +76,15 @@ type sshmonProgramSpecs struct {
 type sshmonMapSpecs struct {
 	Events         *ebpf.MapSpec `ebpf:"events"`
 	MonitoredPorts *ebpf.MapSpec `ebpf:"monitored_ports"`
-	PidToIp        *ebpf.MapSpec `ebpf:"pid_to_ip"`
+	PidCtxMap      *ebpf.MapSpec `ebpf:"pid_ctx_map"`
 }
 
 // sshmonVariableSpecs contains global variables before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type sshmonVariableSpecs struct {
+	AggressiveMode     *ebpf.VariableSpec `ebpf:"aggressive_mode"`
+	PreauthShortConnNs *ebpf.VariableSpec `ebpf:"preauth_short_conn_ns"`
 }
 
 // sshmonObjects contains all objects after they have been loaded into the kernel.
@@ -97,14 +109,14 @@ func (o *sshmonObjects) Close() error {
 type sshmonMaps struct {
 	Events         *ebpf.Map `ebpf:"events"`
 	MonitoredPorts *ebpf.Map `ebpf:"monitored_ports"`
-	PidToIp        *ebpf.Map `ebpf:"pid_to_ip"`
+	PidCtxMap      *ebpf.Map `ebpf:"pid_ctx_map"`
 }
 
 func (m *sshmonMaps) Close() error {
 	return _SshmonClose(
 		m.Events,
 		m.MonitoredPorts,
-		m.PidToIp,
+		m.PidCtxMap,
 	)
 }
 
@@ -112,6 +124,8 @@ func (m *sshmonMaps) Close() error {
 //
 // It can be passed to loadSshmonObjects or ebpf.CollectionSpec.LoadAndAssign.
 type sshmonVariables struct {
+	AggressiveMode     *ebpf.Variable `ebpf:"aggressive_mode"`
+	PreauthShortConnNs *ebpf.Variable `ebpf:"preauth_short_conn_ns"`
 }
 
 // sshmonPrograms contains all programs after they have been loaded into the kernel.

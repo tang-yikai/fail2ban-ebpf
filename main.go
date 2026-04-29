@@ -20,10 +20,17 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
-type SSHFailEvent struct {
-	Pid      uint32
-	RemoteIP uint32
-	RetCode  uint32
+const (
+	eventAuthResult       = 1
+	eventPreauthShortConn = 2
+)
+
+type SSHEvent struct {
+	Type       uint32
+	Pid        uint32
+	RemoteIP   uint32
+	RetCode    uint32
+	DurationNS uint64
 }
 
 func main() {
@@ -40,7 +47,7 @@ func main() {
 	}
 
 	objs := sshmonObjects{}
-	if err := loadSshmonObjects(&objs, nil); err != nil {
+	if err := loadConfiguredSshmonObjects(&objs, cfg); err != nil {
 		fatalf("loading objects: %v", err)
 	}
 	defer objs.Close()
@@ -48,6 +55,12 @@ func main() {
 	eventLogger, err := NewEventLogger(cfg.Log.File)
 	if err != nil {
 		fatalf("create logger: %v", err)
+	}
+
+	banFilter, err := NewBanFilter(cfg)
+	if err != nil {
+		_ = eventLogger.Close()
+		fatalf("create ban filter: %v", err)
 	}
 
 	xdpBlocker, err := NewXDPBlocker(cfg)
@@ -142,14 +155,16 @@ func main() {
 	defer stop()
 
 	eventLogger.Event("service_started", map[string]interface{}{
-		"config":         *configPath,
-		"libpam":         libPath,
-		"log_file":       cfg.Log.File,
-		"ssh_port":       port,
-		"threshold":      cfg.Ban.Threshold,
-		"window_minutes": cfg.Ban.WindowMinutes,
-		"xdp_iface":      cfg.XDP.Iface,
-		"xdp_mode":       xdpBlocker.Mode(),
+		"config":             *configPath,
+		"libpam":             libPath,
+		"log_file":           cfg.Log.File,
+		"mode":               cfg.Mode,
+		"short_conn_seconds": cfg.Ban.ShortConnSeconds,
+		"ssh_port":           port,
+		"threshold":          cfg.Ban.Threshold,
+		"window_minutes":     cfg.Ban.WindowMinutes,
+		"xdp_iface":          cfg.XDP.Iface,
+		"xdp_mode":           xdpBlocker.Mode(),
 	})
 
 	var wg sync.WaitGroup
@@ -162,7 +177,7 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		runPerfLoop(ctx, rd, banManager, xdpBlocker, eventLogger, cfg)
+		runPerfLoop(ctx, rd, banManager, banFilter, xdpBlocker, eventLogger, cfg)
 	}()
 
 	<-ctx.Done()
@@ -275,6 +290,7 @@ func runPerfLoop(
 	ctx context.Context,
 	reader *perf.Reader,
 	banManager *BanManager,
+	banFilter *BanFilter,
 	blocker *XDPBlocker,
 	logger *EventLogger,
 	cfg Config,
@@ -304,7 +320,7 @@ func runPerfLoop(
 			continue
 		}
 
-		var event SSHFailEvent
+		var event SSHEvent
 		if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event); err != nil {
 			logger.Event("warning", map[string]interface{}{
 				"message": fmt.Sprintf("decode perf event: %v", err),
@@ -317,37 +333,106 @@ func runPerfLoop(
 			"pid": event.Pid,
 		}
 
-		if event.RetCode == 0 {
-			logger.Event("auth_success", fields)
-			continue
-		}
-
-		fields["ret"] = event.RetCode
-		logger.Event("auth_failed", fields)
-
-		if event.RemoteIP == 0 {
-			continue
-		}
-
-		if banned, expiresAt := banManager.RegisterFailure(event.RemoteIP, time.Now()); banned {
-			if err := blocker.Ban(event.RemoteIP); err != nil {
-				logger.Event("warning", map[string]interface{}{
-					"message": fmt.Sprintf("failed to ban %s: %v", fields["ip"], err),
-				})
+		switch event.Type {
+		case eventAuthResult:
+			if event.RetCode == 0 {
+				logger.Event("auth_success", fields)
 				continue
 			}
 
-			banFields := map[string]interface{}{
-				"ip":             fields["ip"],
-				"threshold":      cfg.Ban.Threshold,
-				"window_minutes": cfg.Ban.WindowMinutes,
+			fields["ret"] = event.RetCode
+			logger.Event("auth_failed", fields)
+
+			if event.RemoteIP == 0 {
+				continue
 			}
-			if !expiresAt.IsZero() {
-				banFields["expires_at"] = expiresAt.Format(time.RFC3339)
+
+			if banned, expiresAt := banManager.RegisterFailure(event.RemoteIP, time.Now()); banned {
+				logBanResult(banFilter, blocker, logger, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
+					"reason":         "auth_failed",
+					"threshold":      cfg.Ban.Threshold,
+					"window_minutes": cfg.Ban.WindowMinutes,
+				})
 			}
-			logger.Event("ip_blocked", banFields)
+		case eventPreauthShortConn:
+			fields["duration_ms"] = event.DurationNS / uint64(time.Millisecond)
+			logger.Event("preauth_short_conn", fields)
+
+			if event.RemoteIP == 0 {
+				continue
+			}
+			if banned, expiresAt := banManager.RegisterFailure(event.RemoteIP, time.Now()); banned {
+				logBanResult(banFilter, blocker, logger, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
+					"reason":             "preauth_short_conn",
+					"short_conn_seconds": cfg.Ban.ShortConnSeconds,
+					"threshold":          cfg.Ban.Threshold,
+					"window_minutes":     cfg.Ban.WindowMinutes,
+				})
+			}
+		default:
+			logger.Event("warning", map[string]interface{}{
+				"message": fmt.Sprintf("unknown event type %d", event.Type),
+			})
 		}
 	}
+}
+
+func loadConfiguredSshmonObjects(objs *sshmonObjects, cfg Config) error {
+	spec, err := loadSshmon()
+	if err != nil {
+		return err
+	}
+
+	if preauthVar := spec.Variables["preauth_short_conn_ns"]; preauthVar != nil {
+		if err := preauthVar.Set(uint64(cfg.Ban.ShortConnSeconds) * uint64(time.Second)); err != nil {
+			return fmt.Errorf("set preauth_short_conn_ns: %w", err)
+		}
+	}
+	if modeVar := spec.Variables["aggressive_mode"]; modeVar != nil {
+		var enabled uint8
+		if cfg.Mode == "aggressive" {
+			enabled = 1
+		}
+		if err := modeVar.Set(enabled); err != nil {
+			return fmt.Errorf("set aggressive_mode: %w", err)
+		}
+	}
+
+	return spec.LoadAndAssign(objs, nil)
+}
+
+func logBanResult(
+	banFilter *BanFilter,
+	blocker *XDPBlocker,
+	logger *EventLogger,
+	ipValue interface{},
+	rawIP uint32,
+	expiresAt time.Time,
+	fields map[string]interface{},
+) {
+	if allowed, reason := banFilter.Check(rawIP); !allowed {
+		fields["ip"] = ipValue
+		if eventReason, exists := fields["reason"]; exists {
+			fields["event_reason"] = eventReason
+		}
+		fields["skip_reason"] = reason
+		delete(fields, "reason")
+		logger.Event("ban_skipped", fields)
+		return
+	}
+
+	if err := blocker.Ban(rawIP); err != nil {
+		logger.Event("warning", map[string]interface{}{
+			"message": fmt.Sprintf("failed to ban %v: %v", ipValue, err),
+		})
+		return
+	}
+
+	fields["ip"] = ipValue
+	if !expiresAt.IsZero() {
+		fields["expires_at"] = expiresAt.Format(time.RFC3339)
+	}
+	logger.Event("ip_blocked", fields)
 }
 
 func fatalf(format string, args ...interface{}) {

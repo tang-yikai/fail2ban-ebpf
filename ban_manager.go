@@ -8,8 +8,8 @@ import (
 type BanManager struct {
 	mu        sync.Mutex
 	window    time.Duration
-	duration  time.Duration
 	threshold int
+	duration  time.Duration
 	attempts  map[uint32][]time.Time
 	banned    map[uint32]time.Time
 }
@@ -17,8 +17,8 @@ type BanManager struct {
 func NewBanManager(cfg Config) *BanManager {
 	return &BanManager{
 		window:    time.Duration(cfg.Ban.WindowMinutes) * time.Minute,
-		duration:  time.Duration(cfg.Ban.DurationMinutes) * time.Minute,
 		threshold: cfg.Ban.Threshold,
+		duration:  time.Duration(cfg.Ban.DurationMinutes) * time.Minute,
 		attempts:  make(map[uint32][]time.Time),
 		banned:    make(map[uint32]time.Time),
 	}
@@ -28,34 +28,11 @@ func (m *BanManager) RegisterFailure(ip uint32, now time.Time) (bool, time.Time)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if expiresAt, exists := m.banned[ip]; exists && !expiresAt.IsZero() && now.Before(expiresAt) {
-		return false, expiresAt
-	}
-	if expiresAt, exists := m.banned[ip]; exists && expiresAt.IsZero() {
+	if banned, expiresAt := m.isAlreadyBanned(ip, now); banned {
 		return false, expiresAt
 	}
 
-	cutoff := now.Add(-m.window)
-	attempts := m.attempts[ip][:0]
-	for _, ts := range m.attempts[ip] {
-		if !ts.Before(cutoff) {
-			attempts = append(attempts, ts)
-		}
-	}
-	attempts = append(attempts, now)
-	m.attempts[ip] = attempts
-
-	if len(attempts) < m.threshold {
-		return false, time.Time{}
-	}
-
-	var expiresAt time.Time
-	if m.duration > 0 {
-		expiresAt = now.Add(m.duration)
-	}
-	m.banned[ip] = expiresAt
-	delete(m.attempts, ip)
-	return true, expiresAt
+	return m.registerAttempt(ip, now, m.attempts, m.window, m.threshold)
 }
 
 func (m *BanManager) Expired(now time.Time) []uint32 {
@@ -74,4 +51,38 @@ func (m *BanManager) Expired(now time.Time) []uint32 {
 		}
 	}
 	return expired
+}
+
+func (m *BanManager) isAlreadyBanned(ip uint32, now time.Time) (bool, time.Time) {
+	if expiresAt, exists := m.banned[ip]; exists && !expiresAt.IsZero() && now.Before(expiresAt) {
+		return true, expiresAt
+	}
+	if expiresAt, exists := m.banned[ip]; exists && expiresAt.IsZero() {
+		return true, expiresAt
+	}
+	return false, time.Time{}
+}
+
+func (m *BanManager) registerAttempt(ip uint32, now time.Time, attemptsMap map[uint32][]time.Time, window time.Duration, threshold int) (bool, time.Time) {
+	cutoff := now.Add(-window)
+	attempts := attemptsMap[ip][:0]
+	for _, ts := range attemptsMap[ip] {
+		if !ts.Before(cutoff) {
+			attempts = append(attempts, ts)
+		}
+	}
+	attempts = append(attempts, now)
+	attemptsMap[ip] = attempts
+
+	if len(attempts) < threshold {
+		return false, time.Time{}
+	}
+
+	var expiresAt time.Time
+	if m.duration > 0 {
+		expiresAt = now.Add(m.duration)
+	}
+	m.banned[ip] = expiresAt
+	delete(m.attempts, ip)
+	return true, expiresAt
 }

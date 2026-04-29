@@ -71,6 +71,8 @@ time=2026-04-29T12:13:20+08:00 event=ip_unblocked ip=192.168.1.10
 
 - `xdp.iface` 必须是实际承载 SSH 入站流量的网卡。
 - 如果 SSH 监听端口不是 `22`，需要同步修改 `ssh.port`。
+- `mode=normal` 仅统计 PAM 认证失败；`mode=aggressive` 会额外启用 preauth 短连接检测。
+- `whitelist.entries` 支持单个 IPv4 和 IPv4 CIDR；命中白名单或本机地址的 IP 不会下发到 XDP。
 - 某些虚拟网卡或驱动不支持 `offload`/`driver` 模式，程序会自动降级到 `generic`。
 - 如果容器内或宿主机上找不到正确的 `libpam.so.0`，`uprobe` 将无法挂载。
 - 本项目当前主要支持 IPv4 黑名单拦截。
@@ -99,4 +101,3 @@ time=2026-04-29T12:13:20+08:00 event=ip_unblocked ip=192.168.1.10
 - `clang`
 - `llvm`
 - `bpftool`
-
