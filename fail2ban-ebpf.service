@@ -1,0 +1,23 @@
+[Unit]
+Description=fail2ban-ebpf service
+Documentation=https://cnb.cool/LingJianCode/fail2ban-ebpf
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/fail2ban-ebpf
+ExecStart=/usr/local/bin/fail2ban-ebpf -config /etc/fail2ban-ebpf/config.yaml
+Restart=on-failure
+RestartSec=5s
+
+# eBPF/XDP attach and tracing need elevated privileges.
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN
+NoNewPrivileges=false
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
