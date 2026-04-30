@@ -1,4 +1,5 @@
-mode: normal # normal | aggressive
+#mode: normal # normal | aggressive
+mode: aggressive
 
 ssh:
   port: 22 # SSH 监听端口

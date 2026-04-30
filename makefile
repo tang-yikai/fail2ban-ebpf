@@ -24,7 +24,7 @@ gen: vmlinux.h
 
 build: gen
 	@echo "==> Building"
-	CGO_ENABLED=1 $(GO) build -ldflags="-s -w" -o $(APP) 
+	CGO_ENABLED=0 $(GO) build -ldflags="-s -w" -o $(APP) .
 
 clean:
 	@echo "==> Cleaning"
