@@ -331,8 +331,8 @@ func runPerfLoop(
 		fields := map[string]interface{}{
 			"ip":  ipv4String(event.RemoteIP),
 			"pid": event.Pid,
+			"ret": event.RetCode,
 		}
-		fields["ret"] = event.RetCode
 
 		switch event.Type {
 		case eventAuthResult:
