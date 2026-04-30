@@ -332,6 +332,7 @@ func runPerfLoop(
 			"ip":  ipv4String(event.RemoteIP),
 			"pid": event.Pid,
 		}
+		fields["ret"] = event.RetCode
 
 		switch event.Type {
 		case eventAuthResult:
@@ -340,7 +341,6 @@ func runPerfLoop(
 				continue
 			}
 
-			fields["ret"] = event.RetCode
 			logger.Event("auth_failed", fields)
 
 			if event.RemoteIP == 0 {
