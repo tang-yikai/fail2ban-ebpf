@@ -1,0 +1,22 @@
+services:
+  fail2ban-ebpf:
+    build: .
+    container_name: fail2ban-ebpf-build
+    privileged: true
+    pid: host
+    network_mode: host
+    restart: unless-stopped
+    working_dir: /app
+    command: ["-config", "/etc/fail2ban-ebpf/config.yaml"]
+    volumes:
+      - ./config.yaml:/etc/fail2ban-ebpf/config.yaml:ro
+      - ./logs:/app/logs
+      - /sys/fs/bpf:/sys/fs/bpf
+      - /sys/kernel/debug:/sys/kernel/debug
+      - /sys/kernel/btf:/sys/kernel/btf:ro
+      - /usr/lib:/usr/lib:ro
+      - /usr/lib64:/usr/lib64:ro
+      - /lib:/lib:ro
+      - /lib64:/lib64:ro
+    environment:
+      TZ: Asia/Shanghai
