@@ -331,8 +331,8 @@ func runPerfLoop(
 		fields := map[string]interface{}{
 			"ip":  ipv4String(event.RemoteIP),
 			"pid": event.Pid,
+			"ret": event.RetCode,
 		}
-		fields["ret"] = event.RetCode
 
 		switch event.Type {
 		case eventAuthResult:
@@ -361,6 +361,30 @@ func runPerfLoop(
 			if event.RemoteIP == 0 {
 				continue
 			}
+
+			exitStatus := event.RetCode & 0xFFFF
+			exitSignal := (event.RetCode >> 16) & 0xFFFF
+			isCritical := exitSignal == 11 || exitSignal == 4 || exitSignal == 7
+			if !isCritical && exitStatus == 255 && event.DurationNS < uint64(100*time.Millisecond) {
+				isCritical = true
+			}
+
+			if isCritical {
+				expiresAt := banManager.ForceBan(event.RemoteIP, time.Now())
+				reason := "critical_protocol_error"
+				if exitSignal == 11 || exitSignal == 4 || exitSignal == 7 {
+					reason = fmt.Sprintf("critical_signal_%d", exitSignal)
+				}
+				logBanResult(banFilter, blocker, logger, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
+					"reason":         reason,
+					"exit_status":    exitStatus,
+					"exit_signal":    exitSignal,
+					"threshold":      cfg.Ban.Threshold,
+					"window_minutes": cfg.Ban.WindowMinutes,
+				})
+				continue
+			}
+
 			if banned, expiresAt := banManager.RegisterFailure(event.RemoteIP, time.Now()); banned {
 				logBanResult(banFilter, blocker, logger, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
 					"reason":             "preauth_short_conn",
