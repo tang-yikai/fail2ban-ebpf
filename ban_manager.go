@@ -35,6 +35,19 @@ func (m *BanManager) RegisterFailure(ip uint32, now time.Time) (bool, time.Time)
 	return m.registerAttempt(ip, now, m.attempts, m.window, m.threshold)
 }
 
+func (m *BanManager) ForceBan(ip uint32, now time.Time) time.Time {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var expiresAt time.Time
+	if m.duration > 0 {
+		expiresAt = now.Add(m.duration)
+	}
+	m.banned[ip] = expiresAt
+	delete(m.attempts, ip)
+	return expiresAt
+}
+
 func (m *BanManager) Expired(now time.Time) []uint32 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
