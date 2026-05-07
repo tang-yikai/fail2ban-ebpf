@@ -45,9 +45,8 @@ struct {
 } pid_ctx_map SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(__u32));
-    __uint(value_size, sizeof(__u32));
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
 // --- A1. 记录新连接 (fexit 版本，优先使用) ---
@@ -143,8 +142,13 @@ int handle_pam_auth(struct pt_regs *ctx) {
         .ret_code = (__u32)ret,
         .duration_ns = 0,
     };
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &e, sizeof(e));
-    return 0;
+	void *ring = bpf_ringbuf_reserve(&events, sizeof(e), 0);
+	if (!ring) {
+		return 0;
+	}
+	__builtin_memcpy(ring, &e, sizeof(e));
+	bpf_ringbuf_submit(ring, 0);
+	return 0;
 }
 
 // --- D. 进程退出清理 ---
@@ -182,7 +186,13 @@ int handle_exit(struct trace_event_raw_sched_process_template *ctx) {
                     .ret_code = exit_status | (exit_signal << 16), // 把两个信息都给 Go
                     .duration_ns = duration_ns,
                 };
-                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &e, sizeof(e));
+			void *ring = bpf_ringbuf_reserve(&events, sizeof(e), 0);
+			if (!ring) {
+				// ring buffer full, drop event
+			} else {
+				__builtin_memcpy(ring, &e, sizeof(e));
+				bpf_ringbuf_submit(ring, 0);
+			}
             }
         }
     }

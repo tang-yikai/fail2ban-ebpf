@@ -17,7 +17,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 )
 
@@ -113,7 +113,7 @@ func main() {
 // 使用 closers + defer 统一清理，错误时自动按 LIFO 顺序释放已创建的资源。
 func initResources(cfg Config, objs *sshmonObjects) (
 	rt *Runtime,
-	rd *perf.Reader,
+	rd *ringbuf.Reader,
 	libPath string,
 	banFilter *BanFilter,
 	banManager *BanManager,
@@ -184,7 +184,7 @@ func initResources(cfg Config, objs *sshmonObjects) (
 	}
 	closers = append(closers, func() { _ = up.Close() })
 
-	rd, err = perf.NewReader(objs.Events, os.Getpagesize()*64)
+	rd, err = ringbuf.NewReader(objs.Events)
 	if err != nil {
 		return nil, nil, "", nil, nil, nil, fmt.Errorf("create perf reader: %w", err)
 	}
@@ -291,7 +291,7 @@ func runBanExpiryLoop(ctx context.Context, banManager *BanManager, blocker *XDPB
 
 func runPerfLoop(
 	ctx context.Context,
-	reader *perf.Reader,
+	reader *ringbuf.Reader,
 	banManager *BanManager,
 	banFilter *BanFilter,
 	blocker *XDPBlocker,
@@ -310,14 +310,7 @@ func runPerfLoop(
 				return
 			}
 			eventLogger.Event("warning", map[string]interface{}{
-				"message": fmt.Sprintf("read perf event: %v", err),
-			})
-			continue
-		}
-
-		if record.LostSamples > 0 {
-			eventLogger.Event("warning", map[string]interface{}{
-				"message": fmt.Sprintf("lost %d perf samples", record.LostSamples),
+				"message": fmt.Sprintf("read ringbuf event: %v", err),
 			})
 			continue
 		}

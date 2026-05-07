@@ -5,12 +5,12 @@ import (
 	"os"
 
 	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf/ringbuf"
 )
 
 type Runtime struct {
 	objs       *sshmonObjects
-	reader     *perf.Reader
+	reader     *ringbuf.Reader
 	kpAccept   link.Link
 	tpFork     link.Link
 	tpExit     link.Link
@@ -52,5 +52,5 @@ func isClosedPerfError(err error) bool {
 	if err == nil {
 		return false
 	}
-	return errors.Is(err, perf.ErrClosed) || errors.Is(err, os.ErrClosed)
+	return errors.Is(err, ringbuf.ErrClosed) || errors.Is(err, os.ErrClosed)
 }
