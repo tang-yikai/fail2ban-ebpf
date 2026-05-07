@@ -15,7 +15,6 @@ type Runtime struct {
 	tpExit     link.Link
 	pamProbe   link.Link
 	xdpBlocker *XDPBlocker
-	logger     *EventLogger
 }
 
 func (r *Runtime) Close() error {
@@ -33,9 +32,6 @@ func (r *Runtime) Close() error {
 	)
 	if r.xdpBlocker != nil {
 		closeErr = errors.Join(closeErr, r.xdpBlocker.Close())
-	}
-	if r.logger != nil {
-		closeErr = errors.Join(closeErr, r.logger.Close())
 	}
 
 	return closeErr
