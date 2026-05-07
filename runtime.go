@@ -5,22 +5,25 @@ import (
 	"os"
 
 	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf/ringbuf"
 )
 
 type Runtime struct {
-	reader     *perf.Reader
+	objs       *sshmonObjects
+	reader     *ringbuf.Reader
 	kpAccept   link.Link
 	tpFork     link.Link
 	tpExit     link.Link
 	pamProbe   link.Link
 	xdpBlocker *XDPBlocker
-	logger     *EventLogger
 }
 
 func (r *Runtime) Close() error {
 	var closeErr error
 
+	if r.objs != nil {
+		closeErr = errors.Join(closeErr, r.objs.Close())
+	}
 	if r.reader != nil {
 		closeErr = errors.Join(closeErr, r.reader.Close())
 	}
@@ -33,9 +36,6 @@ func (r *Runtime) Close() error {
 	)
 	if r.xdpBlocker != nil {
 		closeErr = errors.Join(closeErr, r.xdpBlocker.Close())
-	}
-	if r.logger != nil {
-		closeErr = errors.Join(closeErr, r.logger.Close())
 	}
 
 	return closeErr
@@ -52,5 +52,5 @@ func isClosedPerfError(err error) bool {
 	if err == nil {
 		return false
 	}
-	return errors.Is(err, perf.ErrClosed) || errors.Is(err, os.ErrClosed)
+	return errors.Is(err, ringbuf.ErrClosed) || errors.Is(err, os.ErrClosed)
 }

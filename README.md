@@ -26,7 +26,7 @@
 ## 运行要求
 
 - Linux
-- 支持 eBPF / XDP 的内核
+- 支持 eBPF / XDP 的内核（5.10以上）
 - 宿主机存在 `/sys/kernel/btf/vmlinux`
 - 需要 root 权限
 - 需要宿主机存在 `libpam.so.0`

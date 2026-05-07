@@ -15,10 +15,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 )
+
+var eventLogger *EventLogger
 
 const (
 	eventAuthResult       = 1
@@ -52,104 +55,17 @@ func main() {
 	}
 	defer objs.Close()
 
-	eventLogger, err := NewEventLogger(cfg.Log.File)
+	eventLogger, err = NewEventLogger(cfg.Log.File)
 	if err != nil {
 		fatalf("create logger: %v", err)
 	}
+	defer eventLogger.Close()
 
-	banFilter, err := NewBanFilter(cfg)
+	rt, rd, libPath, banFilter, banManager, xdpBlocker, err := initResources(cfg, &objs)
 	if err != nil {
-		_ = eventLogger.Close()
-		fatalf("create ban filter: %v", err)
+		fatalf("init: %v", err)
 	}
-
-	xdpBlocker, err := NewXDPBlocker(cfg)
-	if err != nil {
-		_ = eventLogger.Close()
-		fatalf("attach xdp: %v", err)
-	}
-
-	banManager := NewBanManager(cfg)
-
-	port := cfg.SSH.Port
-	var enabled uint8 = 1
-	if err := objs.MonitoredPorts.Update(port, enabled, 0); err != nil {
-		_ = xdpBlocker.Close()
-		_ = eventLogger.Close()
-		fatalf("failed to update port map: %v", err)
-	}
-
-	kpAccept, err := link.Kretprobe("inet_csk_accept", objs.HandleAcceptReturn, nil)
-	if err != nil {
-		_ = xdpBlocker.Close()
-		_ = eventLogger.Close()
-		fatalf("failed to attach kretprobe: %v", err)
-	}
-
-	tpFork, err := link.Tracepoint("sched", "sched_process_fork", objs.HandleFork, nil)
-	if err != nil {
-		_ = kpAccept.Close()
-		_ = xdpBlocker.Close()
-		_ = eventLogger.Close()
-		fatalf("failed to attach sched_process_fork: %v", err)
-	}
-
-	tpExit, err := link.Tracepoint("sched", "sched_process_exit", objs.HandleExit, nil)
-	if err != nil {
-		_ = tpFork.Close()
-		_ = kpAccept.Close()
-		_ = xdpBlocker.Close()
-		_ = eventLogger.Close()
-		fatalf("failed to attach sched_process_exit: %v", err)
-	}
-
-	libPath := findLibPAM()
-	if err := ensureExecutable(libPath); err != nil {
-		eventLogger.Event("warning", map[string]interface{}{
-			"message": fmt.Sprintf("could not ensure executable bit on %s: %v", libPath, err),
-		})
-	}
-
-	ex, err := link.OpenExecutable(libPath)
-	if err != nil {
-		_ = tpExit.Close()
-		_ = tpFork.Close()
-		_ = kpAccept.Close()
-		_ = xdpBlocker.Close()
-		_ = eventLogger.Close()
-		fatalf("open libpam: %v", err)
-	}
-
-	up, err := ex.Uretprobe("pam_authenticate", objs.HandlePamAuth, nil)
-	if err != nil {
-		_ = tpExit.Close()
-		_ = tpFork.Close()
-		_ = kpAccept.Close()
-		_ = xdpBlocker.Close()
-		_ = eventLogger.Close()
-		fatalf("attach uretprobe: %v", err)
-	}
-
-	rd, err := perf.NewReader(objs.Events, os.Getpagesize()*64)
-	if err != nil {
-		_ = up.Close()
-		_ = tpExit.Close()
-		_ = tpFork.Close()
-		_ = kpAccept.Close()
-		_ = xdpBlocker.Close()
-		_ = eventLogger.Close()
-		fatalf("create perf reader: %v", err)
-	}
-
-	rt := &Runtime{
-		reader:     rd,
-		kpAccept:   kpAccept,
-		tpFork:     tpFork,
-		tpExit:     tpExit,
-		pamProbe:   up,
-		xdpBlocker: xdpBlocker,
-		logger:     eventLogger,
-	}
+	defer rt.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -160,7 +76,7 @@ func main() {
 		"log_file":           cfg.Log.File,
 		"mode":               cfg.Mode,
 		"short_conn_seconds": cfg.Ban.ShortConnSeconds,
-		"ssh_port":           port,
+		"ssh_port":           cfg.SSH.Port,
 		"threshold":          cfg.Ban.Threshold,
 		"window_minutes":     cfg.Ban.WindowMinutes,
 		"xdp_iface":          cfg.XDP.Iface,
@@ -172,12 +88,12 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		runBanExpiryLoop(ctx, banManager, xdpBlocker, eventLogger)
+		runBanExpiryLoop(ctx, banManager, xdpBlocker)
 	}()
 
 	go func() {
 		defer wg.Done()
-		runPerfLoop(ctx, rd, banManager, banFilter, xdpBlocker, eventLogger, cfg)
+		runEventProcessor(ctx, rd, banManager, banFilter, xdpBlocker, cfg)
 	}()
 
 	<-ctx.Done()
@@ -185,18 +101,105 @@ func main() {
 		"signal": ctx.Err().Error(),
 	})
 
-	if err := rd.Close(); err != nil && !isClosedPerfError(err) {
-		eventLogger.Event("warning", map[string]interface{}{
-			"message": fmt.Sprintf("close perf reader: %v", err),
-		})
-	}
-
 	wg.Wait()
 	eventLogger.Event("service_stopped", map[string]interface{}{})
 
 	if err := rt.Close(); err != nil && !isClosedPerfError(err) {
 		fatalf("shutdown resources: %v", err)
 	}
+}
+
+// initResources 初始化所有 BPF 探针、XDP 和 perf reader。
+// 使用 closers + defer 统一清理，错误时自动按 LIFO 顺序释放已创建的资源。
+func initResources(cfg Config, objs *sshmonObjects) (
+	rt *Runtime,
+	rd *ringbuf.Reader,
+	libPath string,
+	banFilter *BanFilter,
+	banManager *BanManager,
+	xdpBlocker *XDPBlocker,
+	err error,
+) {
+	var closers []func()
+	defer func() {
+		if err != nil {
+			for i := len(closers) - 1; i >= 0; i-- {
+				closers[i]()
+			}
+		}
+	}()
+
+	banFilter, err = NewBanFilter(cfg)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("create ban filter: %w", err)
+	}
+
+	xdpBlocker, err = NewXDPBlocker(cfg)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("attach xdp: %w", err)
+	}
+	closers = append(closers, func() { _ = xdpBlocker.Close() })
+
+	banManager = NewBanManager(cfg)
+
+	port := cfg.SSH.Port
+	var enabled uint8 = 1
+	if err = objs.MonitoredPorts.Update(port, enabled, 0); err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("update port map: %w", err)
+	}
+
+	kpAccept, err := attachAcceptProbe(objs)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("attach accept probe: %w", err)
+	}
+	closers = append(closers, func() { _ = kpAccept.Close() })
+
+	tpFork, err := link.Tracepoint("sched", "sched_process_fork", objs.HandleFork, nil)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("attach sched_process_fork: %w", err)
+	}
+	closers = append(closers, func() { _ = tpFork.Close() })
+
+	tpExit, err := link.Tracepoint("sched", "sched_process_exit", objs.HandleExit, nil)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("attach sched_process_exit: %w", err)
+	}
+	closers = append(closers, func() { _ = tpExit.Close() })
+
+	libPath = findLibPAM()
+	if err := ensureExecutable(libPath); err != nil {
+		eventLogger.Event("warning", map[string]interface{}{
+			"message": fmt.Sprintf("could not ensure executable bit on %s: %v", libPath, err),
+		})
+	}
+
+	ex, err := link.OpenExecutable(libPath)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("open libpam: %w", err)
+	}
+
+	up, err := ex.Uretprobe("pam_authenticate", objs.HandlePamAuth, nil)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("attach uretprobe: %w", err)
+	}
+	closers = append(closers, func() { _ = up.Close() })
+
+	rd, err = ringbuf.NewReader(objs.Events)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("create perf reader: %w", err)
+	}
+	closers = append(closers, func() { _ = rd.Close() })
+
+	rt = &Runtime{
+		objs:       objs,
+		reader:     rd,
+		kpAccept:   kpAccept,
+		tpFork:     tpFork,
+		tpExit:     tpExit,
+		pamProbe:   up,
+		xdpBlocker: xdpBlocker,
+	}
+	return rt, rd, libPath, banFilter, banManager, xdpBlocker, nil
 }
 
 // findLibPAM 自动适配架构并动态查找 libpam 路径
@@ -262,7 +265,7 @@ func ipv4String(raw uint32) string {
 	return ip.String()
 }
 
-func runBanExpiryLoop(ctx context.Context, banManager *BanManager, blocker *XDPBlocker, logger *EventLogger) {
+func runBanExpiryLoop(ctx context.Context, banManager *BanManager, blocker *XDPBlocker) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 
@@ -271,12 +274,12 @@ func runBanExpiryLoop(ctx context.Context, banManager *BanManager, blocker *XDPB
 		case <-ticker.C:
 			for _, ip := range banManager.Expired(time.Now()) {
 				if err := blocker.Unban(ip); err != nil {
-					logger.Event("warning", map[string]interface{}{
+					eventLogger.Event("warning", map[string]interface{}{
 						"message": fmt.Sprintf("failed to unban %s: %v", ipv4String(ip), err),
 					})
 					continue
 				}
-				logger.Event("ip_unblocked", map[string]interface{}{
+				eventLogger.Event("ip_unblocked", map[string]interface{}{
 					"ip": ipv4String(ip),
 				})
 			}
@@ -286,119 +289,150 @@ func runBanExpiryLoop(ctx context.Context, banManager *BanManager, blocker *XDPB
 	}
 }
 
-func runPerfLoop(
+func runEventProcessor(
 	ctx context.Context,
-	reader *perf.Reader,
+	reader *ringbuf.Reader,
 	banManager *BanManager,
 	banFilter *BanFilter,
 	blocker *XDPBlocker,
-	logger *EventLogger,
 	cfg Config,
 ) {
+	type readResult struct {
+		record ringbuf.Record
+		err    error
+	}
+
 	for {
+		readCh := make(chan readResult, 1)
+		go func() {
+			rec, err := reader.Read()
+			readCh <- readResult{record: rec, err: err}
+		}()
+
 		select {
 		case <-ctx.Done():
+			_ = reader.Close()
+			<-readCh // 等待 Read goroutine 退出，避免泄漏
 			return
-		default:
-		}
-
-		record, err := reader.Read()
-		if err != nil {
-			if isClosedPerfError(err) || ctx.Err() != nil {
-				return
-			}
-			logger.Event("warning", map[string]interface{}{
-				"message": fmt.Sprintf("read perf event: %v", err),
-			})
-			continue
-		}
-
-		if record.LostSamples > 0 {
-			logger.Event("warning", map[string]interface{}{
-				"message": fmt.Sprintf("lost %d perf samples", record.LostSamples),
-			})
-			continue
-		}
-
-		var event SSHEvent
-		if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event); err != nil {
-			logger.Event("warning", map[string]interface{}{
-				"message": fmt.Sprintf("decode perf event: %v", err),
-			})
-			continue
-		}
-
-		fields := map[string]interface{}{
-			"ip":  ipv4String(event.RemoteIP),
-			"pid": event.Pid,
-			"ret": event.RetCode,
-		}
-
-		switch event.Type {
-		case eventAuthResult:
-			if event.RetCode == 0 {
-				logger.Event("auth_success", fields)
-				continue
-			}
-
-			logger.Event("auth_failed", fields)
-
-			if event.RemoteIP == 0 {
-				continue
-			}
-
-			if banned, expiresAt := banManager.RegisterFailure(event.RemoteIP, time.Now()); banned {
-				logBanResult(banFilter, blocker, logger, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
-					"reason":         "auth_failed",
-					"threshold":      cfg.Ban.Threshold,
-					"window_minutes": cfg.Ban.WindowMinutes,
-				})
-			}
-		case eventPreauthShortConn:
-			fields["duration_ms"] = event.DurationNS / uint64(time.Millisecond)
-			logger.Event("preauth_short_conn", fields)
-
-			if event.RemoteIP == 0 {
-				continue
-			}
-
-			exitStatus := event.RetCode & 0xFFFF
-			exitSignal := (event.RetCode >> 16) & 0xFFFF
-			isCritical := exitSignal == 11 || exitSignal == 4 || exitSignal == 7
-			if !isCritical && exitStatus == 255 && event.DurationNS < uint64(100*time.Millisecond) {
-				isCritical = true
-			}
-
-			if isCritical {
-				expiresAt := banManager.ForceBan(event.RemoteIP, time.Now())
-				reason := "critical_protocol_error"
-				if exitSignal == 11 || exitSignal == 4 || exitSignal == 7 {
-					reason = fmt.Sprintf("critical_signal_%d", exitSignal)
+		case result := <-readCh:
+			if result.err != nil {
+				if isClosedPerfError(result.err) || ctx.Err() != nil {
+					return
 				}
-				logBanResult(banFilter, blocker, logger, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
-					"reason":         reason,
-					"exit_status":    exitStatus,
-					"exit_signal":    exitSignal,
-					"threshold":      cfg.Ban.Threshold,
-					"window_minutes": cfg.Ban.WindowMinutes,
+				eventLogger.Event("warning", map[string]interface{}{
+					"message": fmt.Sprintf("read ringbuf event: %v", result.err),
 				})
 				continue
 			}
 
-			if banned, expiresAt := banManager.RegisterFailure(event.RemoteIP, time.Now()); banned {
-				logBanResult(banFilter, blocker, logger, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
-					"reason":             "preauth_short_conn",
-					"short_conn_seconds": cfg.Ban.ShortConnSeconds,
-					"threshold":          cfg.Ban.Threshold,
-					"window_minutes":     cfg.Ban.WindowMinutes,
+			var event SSHEvent
+			if err := binary.Read(bytes.NewBuffer(result.record.RawSample), binary.LittleEndian, &event); err != nil {
+				eventLogger.Event("warning", map[string]interface{}{
+					"message": fmt.Sprintf("decode perf event: %v", err),
+				})
+				continue
+			}
+
+			fields := map[string]interface{}{
+				"ip":  ipv4String(event.RemoteIP),
+				"pid": event.Pid,
+				"ret": event.RetCode,
+			}
+
+			switch event.Type {
+			case eventAuthResult:
+				if event.RetCode == 0 {
+					eventLogger.Event("auth_success", fields)
+					continue
+				}
+
+				eventLogger.Event("auth_failed", fields)
+
+				if event.RemoteIP == 0 {
+					continue
+				}
+
+				if banned, expiresAt := banManager.RegisterFailure(event.RemoteIP, time.Now()); banned {
+					logBanResult(banFilter, blocker, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
+						"reason":         "auth_failed",
+						"threshold":      cfg.Ban.Threshold,
+						"window_minutes": cfg.Ban.WindowMinutes,
+					})
+				}
+			case eventPreauthShortConn:
+				fields["duration_ms"] = event.DurationNS / uint64(time.Millisecond)
+				eventLogger.Event("preauth_short_conn", fields)
+
+				if event.RemoteIP == 0 {
+					continue
+				}
+
+				exitStatus := event.RetCode & 0xFFFF
+				exitSignal := (event.RetCode >> 16) & 0xFFFF
+				isCritical := exitSignal == 11 || exitSignal == 4 || exitSignal == 7
+				if !isCritical && exitStatus == 255 && event.DurationNS < uint64(100*time.Millisecond) {
+					isCritical = true
+				}
+
+				if isCritical {
+					expiresAt := banManager.ForceBan(event.RemoteIP, time.Now())
+					reason := "critical_protocol_error"
+					if exitSignal == 11 || exitSignal == 4 || exitSignal == 7 {
+						reason = fmt.Sprintf("critical_signal_%d", exitSignal)
+					}
+					logBanResult(banFilter, blocker, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
+						"reason":         reason,
+						"exit_status":    exitStatus,
+						"exit_signal":    exitSignal,
+						"threshold":      cfg.Ban.Threshold,
+						"window_minutes": cfg.Ban.WindowMinutes,
+					})
+					continue
+				}
+
+				if banned, expiresAt := banManager.RegisterFailure(event.RemoteIP, time.Now()); banned {
+					logBanResult(banFilter, blocker, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
+						"reason":             "preauth_short_conn",
+						"short_conn_seconds": cfg.Ban.ShortConnSeconds,
+						"threshold":          cfg.Ban.Threshold,
+						"window_minutes":     cfg.Ban.WindowMinutes,
+					})
+				}
+			default:
+				eventLogger.Event("warning", map[string]interface{}{
+					"message": fmt.Sprintf("unknown event type %d", event.Type),
 				})
 			}
-		default:
-			logger.Event("warning", map[string]interface{}{
-				"message": fmt.Sprintf("unknown event type %d", event.Type),
-			})
 		}
 	}
+}
+
+func attachAcceptProbe(objs *sshmonObjects) (link.Link, error) {
+	// 1. 优先尝试 fexit（性能更优，可同时获取参数和返回值）
+	l, err := link.AttachTracing(link.TracingOptions{
+		Program:    objs.HandleAcceptFexit,
+		AttachType: ebpf.AttachTraceFExit,
+	})
+	if err == nil {
+		eventLogger.Event("probe_attached", map[string]interface{}{
+			"target": "fexit/inet_csk_accept",
+		})
+		return l, nil
+	}
+	eventLogger.Event("warning", map[string]interface{}{
+		"message": fmt.Sprintf("fexit/inet_csk_accept failed: %v, falling back to kretprobe", err),
+	})
+
+	// 2. 回退到 kretprobe（兼容不支持 BTF 的老内核）
+	l, err = link.Kretprobe("inet_csk_accept", objs.HandleAcceptKretprobe, nil)
+	if err == nil {
+		eventLogger.Event("probe_attached", map[string]interface{}{
+			"target": "kretprobe/inet_csk_accept (fallback)",
+		})
+		return l, nil
+	}
+
+	return nil, fmt.Errorf("both fexit and kretprobe attach failed: %w", err)
 }
 
 func loadConfiguredSshmonObjects(objs *sshmonObjects, cfg Config) error {
@@ -428,7 +462,6 @@ func loadConfiguredSshmonObjects(objs *sshmonObjects, cfg Config) error {
 func logBanResult(
 	banFilter *BanFilter,
 	blocker *XDPBlocker,
-	logger *EventLogger,
 	ipValue interface{},
 	rawIP uint32,
 	expiresAt time.Time,
@@ -441,12 +474,12 @@ func logBanResult(
 		}
 		fields["skip_reason"] = reason
 		delete(fields, "reason")
-		logger.Event("ban_skipped", fields)
+		eventLogger.Event("ban_skipped", fields)
 		return
 	}
 
 	if err := blocker.Ban(rawIP); err != nil {
-		logger.Event("warning", map[string]interface{}{
+		eventLogger.Event("warning", map[string]interface{}{
 			"message": fmt.Sprintf("failed to ban %v: %v", ipValue, err),
 		})
 		return
@@ -456,7 +489,7 @@ func logBanResult(
 	if !expiresAt.IsZero() {
 		fields["expires_at"] = expiresAt.Format(time.RFC3339)
 	}
-	logger.Event("ip_blocked", fields)
+	eventLogger.Event("ip_blocked", fields)
 }
 
 func fatalf(format string, args ...interface{}) {

@@ -45,21 +45,22 @@ struct {
 } pid_ctx_map SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(__u32));
-    __uint(value_size, sizeof(__u32));
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
-// --- A. 记录新连接 (使用 kretprobe 确保在 sshd 进程上下文中) ---
-SEC("kretprobe/inet_csk_accept")
-int BPF_KRETPROBE(handle_accept_return, struct sock *newsk) {
+// --- A1. 记录新连接 (fexit 版本，优先使用) ---
+// fexit 可同时获取函数参数和返回值，性能优于 kretprobe
+SEC("fexit/inet_csk_accept")
+int BPF_PROG(handle_accept_fexit, struct sock *sk, struct sockaddr *addr,
+             int addr_len, int flags, struct sock *newsk) {
     if (!newsk) {
         return 0;
     }
 
     // 获取本地端口 (skc_num 是主机字节序)
     __u16 lport = BPF_CORE_READ(newsk, __sk_common.skc_num);
-    
+
     // 仅记录监控端口（如 22）
     if (!bpf_map_lookup_elem(&monitored_ports, &lport)) {
         return 0;
@@ -75,7 +76,36 @@ int BPF_KRETPROBE(handle_accept_return, struct sock *newsk) {
 
     // 记录映射：当前 sshd 主进程 PID -> 连接上下文
     bpf_map_update_elem(&pid_ctx_map, &pid, &conn_ctx, BPF_ANY);
-    
+
+    return 0;
+}
+
+// --- A2. 记录新连接 (kretprobe 兼容版本，作为 fentry/fexit 不可用时的回退) ---
+SEC("kretprobe/inet_csk_accept")
+int BPF_KRETPROBE(handle_accept_kretprobe, struct sock *newsk) {
+    if (!newsk) {
+        return 0;
+    }
+
+    // 获取本地端口 (skc_num 是主机字节序)
+    __u16 lport = BPF_CORE_READ(newsk, __sk_common.skc_num);
+
+    // 仅记录监控端口（如 22）
+    if (!bpf_map_lookup_elem(&monitored_ports, &lport)) {
+        return 0;
+    }
+
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    __u32 daddr = BPF_CORE_READ(newsk, __sk_common.skc_daddr);
+    struct pid_ctx conn_ctx = {
+        .remote_ip = daddr,
+        .start_ns = bpf_ktime_get_ns(),
+        .auth_attempted = 0,
+    };
+
+    // 记录映射：当前 sshd 主进程 PID -> 连接上下文
+    bpf_map_update_elem(&pid_ctx_map, &pid, &conn_ctx, BPF_ANY);
+
     return 0;
 }
 
@@ -112,8 +142,13 @@ int handle_pam_auth(struct pt_regs *ctx) {
         .ret_code = (__u32)ret,
         .duration_ns = 0,
     };
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &e, sizeof(e));
-    return 0;
+	void *ring = bpf_ringbuf_reserve(&events, sizeof(e), 0);
+	if (!ring) {
+		return 0;
+	}
+	__builtin_memcpy(ring, &e, sizeof(e));
+	bpf_ringbuf_submit(ring, 0);
+	return 0;
 }
 
 // --- D. 进程退出清理 ---
@@ -151,7 +186,13 @@ int handle_exit(struct trace_event_raw_sched_process_template *ctx) {
                     .ret_code = exit_status | (exit_signal << 16), // 把两个信息都给 Go
                     .duration_ns = duration_ns,
                 };
-                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &e, sizeof(e));
+			void *ring = bpf_ringbuf_reserve(&events, sizeof(e), 0);
+			if (!ring) {
+				// ring buffer full, drop event
+			} else {
+				__builtin_memcpy(ring, &e, sizeof(e));
+				bpf_ringbuf_submit(ring, 0);
+			}
             }
         }
     }
