@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
 	"github.com/cilium/ebpf/rlimit"
@@ -79,11 +80,11 @@ func main() {
 		fatalf("failed to update port map: %v", err)
 	}
 
-	kpAccept, err := link.Kretprobe("inet_csk_accept", objs.HandleAcceptReturn, nil)
+	kpAccept, err := attachAcceptProbe(objs)
 	if err != nil {
 		_ = xdpBlocker.Close()
 		_ = eventLogger.Close()
-		fatalf("failed to attach kretprobe: %v", err)
+		fatalf("failed to attach accept probe: %v", err)
 	}
 
 	tpFork, err := link.Tracepoint("sched", "sched_process_fork", objs.HandleFork, nil)
@@ -399,6 +400,28 @@ func runPerfLoop(
 			})
 		}
 	}
+}
+
+func attachAcceptProbe(objs *sshmonObjects) (link.Link, error) {
+	// 1. 优先尝试 fexit（性能更优，可同时获取参数和返回值）
+	l, err := link.AttachTracing(link.TracingOptions{
+		Program:    objs.HandleAcceptFexit,
+		AttachType: ebpf.AttachTraceFExit,
+	})
+	if err == nil {
+		fmt.Fprintln(os.Stderr, "[info] attached fexit/inet_csk_accept")
+		return l, nil
+	}
+	fmt.Fprintf(os.Stderr, "[warn] fexit/inet_csk_accept failed: %v, falling back to kretprobe\n", err)
+
+	// 2. 回退到 kretprobe（兼容不支持 BTF 的老内核）
+	l, err = link.Kretprobe("inet_csk_accept", objs.HandleAcceptKretprobe, nil)
+	if err == nil {
+		fmt.Fprintln(os.Stderr, "[info] attached kretprobe/inet_csk_accept (fallback)")
+		return l, nil
+	}
+
+	return nil, fmt.Errorf("both fexit and kretprobe attach failed: %w", err)
 }
 
 func loadConfiguredSshmonObjects(objs *sshmonObjects, cfg Config) error {
