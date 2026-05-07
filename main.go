@@ -93,7 +93,7 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		runPerfLoop(ctx, rd, banManager, banFilter, xdpBlocker, cfg)
+		runEventProcessor(ctx, rd, banManager, banFilter, xdpBlocker, cfg)
 	}()
 
 	<-ctx.Done()
@@ -289,7 +289,7 @@ func runBanExpiryLoop(ctx context.Context, banManager *BanManager, blocker *XDPB
 	}
 }
 
-func runPerfLoop(
+func runEventProcessor(
 	ctx context.Context,
 	reader *ringbuf.Reader,
 	banManager *BanManager,
@@ -300,6 +300,7 @@ func runPerfLoop(
 	for {
 		select {
 		case <-ctx.Done():
+			_ = reader.Close() // 让阻塞的 Read() 立即返回 ErrClosed
 			return
 		default:
 		}
