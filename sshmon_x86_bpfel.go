@@ -64,11 +64,11 @@ type sshmonSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type sshmonProgramSpecs struct {
-	HandleAcceptFexit    *ebpf.ProgramSpec `ebpf:"handle_accept_fexit"`
+	HandleAcceptFexit     *ebpf.ProgramSpec `ebpf:"handle_accept_fexit"`
 	HandleAcceptKretprobe *ebpf.ProgramSpec `ebpf:"handle_accept_kretprobe"`
-	HandleExit           *ebpf.ProgramSpec `ebpf:"handle_exit"`
-	HandleFork           *ebpf.ProgramSpec `ebpf:"handle_fork"`
-	HandlePamAuth        *ebpf.ProgramSpec `ebpf:"handle_pam_auth"`
+	HandleExit            *ebpf.ProgramSpec `ebpf:"handle_exit"`
+	HandleFork            *ebpf.ProgramSpec `ebpf:"handle_fork"`
+	HandlePamAuth         *ebpf.ProgramSpec `ebpf:"handle_pam_auth"`
 }
 
 // sshmonMapSpecs contains maps before they are loaded into the kernel.
@@ -133,11 +133,11 @@ type sshmonVariables struct {
 //
 // It can be passed to loadSshmonObjects or ebpf.CollectionSpec.LoadAndAssign.
 type sshmonPrograms struct {
-	HandleAcceptFexit    *ebpf.Program `ebpf:"handle_accept_fexit"`
+	HandleAcceptFexit     *ebpf.Program `ebpf:"handle_accept_fexit"`
 	HandleAcceptKretprobe *ebpf.Program `ebpf:"handle_accept_kretprobe"`
-	HandleExit           *ebpf.Program `ebpf:"handle_exit"`
-	HandleFork           *ebpf.Program `ebpf:"handle_fork"`
-	HandlePamAuth        *ebpf.Program `ebpf:"handle_pam_auth"`
+	HandleExit            *ebpf.Program `ebpf:"handle_exit"`
+	HandleFork            *ebpf.Program `ebpf:"handle_fork"`
+	HandlePamAuth         *ebpf.Program `ebpf:"handle_pam_auth"`
 }
 
 func (p *sshmonPrograms) Close() error {

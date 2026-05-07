@@ -80,7 +80,7 @@ func main() {
 		fatalf("failed to update port map: %v", err)
 	}
 
-	kpAccept, err := attachAcceptProbe(objs)
+	kpAccept, err := attachAcceptProbe(&objs)
 	if err != nil {
 		_ = xdpBlocker.Close()
 		_ = eventLogger.Close()
