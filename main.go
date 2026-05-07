@@ -297,102 +297,112 @@ func runEventProcessor(
 	blocker *XDPBlocker,
 	cfg Config,
 ) {
+	type readResult struct {
+		record ringbuf.Record
+		err    error
+	}
+
 	for {
+		readCh := make(chan readResult, 1)
+		go func() {
+			rec, err := reader.Read()
+			readCh <- readResult{record: rec, err: err}
+		}()
+
 		select {
 		case <-ctx.Done():
-			_ = reader.Close() // 让阻塞的 Read() 立即返回 ErrClosed
+			_ = reader.Close()
+			<-readCh // 等待 Read goroutine 退出，避免泄漏
 			return
-		default:
-		}
-
-		record, err := reader.Read()
-		if err != nil {
-			if isClosedPerfError(err) || ctx.Err() != nil {
-				return
-			}
-			eventLogger.Event("warning", map[string]interface{}{
-				"message": fmt.Sprintf("read ringbuf event: %v", err),
-			})
-			continue
-		}
-
-		var event SSHEvent
-		if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event); err != nil {
-			eventLogger.Event("warning", map[string]interface{}{
-				"message": fmt.Sprintf("decode perf event: %v", err),
-			})
-			continue
-		}
-
-		fields := map[string]interface{}{
-			"ip":  ipv4String(event.RemoteIP),
-			"pid": event.Pid,
-			"ret": event.RetCode,
-		}
-
-		switch event.Type {
-		case eventAuthResult:
-			if event.RetCode == 0 {
-				eventLogger.Event("auth_success", fields)
-				continue
-			}
-
-			eventLogger.Event("auth_failed", fields)
-
-			if event.RemoteIP == 0 {
-				continue
-			}
-
-			if banned, expiresAt := banManager.RegisterFailure(event.RemoteIP, time.Now()); banned {
-				logBanResult(banFilter, blocker, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
-					"reason":         "auth_failed",
-					"threshold":      cfg.Ban.Threshold,
-					"window_minutes": cfg.Ban.WindowMinutes,
-				})
-			}
-		case eventPreauthShortConn:
-			fields["duration_ms"] = event.DurationNS / uint64(time.Millisecond)
-			eventLogger.Event("preauth_short_conn", fields)
-
-			if event.RemoteIP == 0 {
-				continue
-			}
-
-			exitStatus := event.RetCode & 0xFFFF
-			exitSignal := (event.RetCode >> 16) & 0xFFFF
-			isCritical := exitSignal == 11 || exitSignal == 4 || exitSignal == 7
-			if !isCritical && exitStatus == 255 && event.DurationNS < uint64(100*time.Millisecond) {
-				isCritical = true
-			}
-
-			if isCritical {
-				expiresAt := banManager.ForceBan(event.RemoteIP, time.Now())
-				reason := "critical_protocol_error"
-				if exitSignal == 11 || exitSignal == 4 || exitSignal == 7 {
-					reason = fmt.Sprintf("critical_signal_%d", exitSignal)
+		case result := <-readCh:
+			if result.err != nil {
+				if isClosedPerfError(result.err) || ctx.Err() != nil {
+					return
 				}
-				logBanResult(banFilter, blocker, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
-					"reason":         reason,
-					"exit_status":    exitStatus,
-					"exit_signal":    exitSignal,
-					"threshold":      cfg.Ban.Threshold,
-					"window_minutes": cfg.Ban.WindowMinutes,
+				eventLogger.Event("warning", map[string]interface{}{
+					"message": fmt.Sprintf("read ringbuf event: %v", result.err),
 				})
 				continue
 			}
 
-			if banned, expiresAt := banManager.RegisterFailure(event.RemoteIP, time.Now()); banned {
-				logBanResult(banFilter, blocker, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
-					"reason":             "preauth_short_conn",
-					"short_conn_seconds": cfg.Ban.ShortConnSeconds,
-					"threshold":          cfg.Ban.Threshold,
-					"window_minutes":     cfg.Ban.WindowMinutes,
+			var event SSHEvent
+			if err := binary.Read(bytes.NewBuffer(result.record.RawSample), binary.LittleEndian, &event); err != nil {
+				eventLogger.Event("warning", map[string]interface{}{
+					"message": fmt.Sprintf("decode perf event: %v", err),
+				})
+				continue
+			}
+
+			fields := map[string]interface{}{
+				"ip":  ipv4String(event.RemoteIP),
+				"pid": event.Pid,
+				"ret": event.RetCode,
+			}
+
+			switch event.Type {
+			case eventAuthResult:
+				if event.RetCode == 0 {
+					eventLogger.Event("auth_success", fields)
+					continue
+				}
+
+				eventLogger.Event("auth_failed", fields)
+
+				if event.RemoteIP == 0 {
+					continue
+				}
+
+				if banned, expiresAt := banManager.RegisterFailure(event.RemoteIP, time.Now()); banned {
+					logBanResult(banFilter, blocker, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
+						"reason":         "auth_failed",
+						"threshold":      cfg.Ban.Threshold,
+						"window_minutes": cfg.Ban.WindowMinutes,
+					})
+				}
+			case eventPreauthShortConn:
+				fields["duration_ms"] = event.DurationNS / uint64(time.Millisecond)
+				eventLogger.Event("preauth_short_conn", fields)
+
+				if event.RemoteIP == 0 {
+					continue
+				}
+
+				exitStatus := event.RetCode & 0xFFFF
+				exitSignal := (event.RetCode >> 16) & 0xFFFF
+				isCritical := exitSignal == 11 || exitSignal == 4 || exitSignal == 7
+				if !isCritical && exitStatus == 255 && event.DurationNS < uint64(100*time.Millisecond) {
+					isCritical = true
+				}
+
+				if isCritical {
+					expiresAt := banManager.ForceBan(event.RemoteIP, time.Now())
+					reason := "critical_protocol_error"
+					if exitSignal == 11 || exitSignal == 4 || exitSignal == 7 {
+						reason = fmt.Sprintf("critical_signal_%d", exitSignal)
+					}
+					logBanResult(banFilter, blocker, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
+						"reason":         reason,
+						"exit_status":    exitStatus,
+						"exit_signal":    exitSignal,
+						"threshold":      cfg.Ban.Threshold,
+						"window_minutes": cfg.Ban.WindowMinutes,
+					})
+					continue
+				}
+
+				if banned, expiresAt := banManager.RegisterFailure(event.RemoteIP, time.Now()); banned {
+					logBanResult(banFilter, blocker, fields["ip"], event.RemoteIP, expiresAt, map[string]interface{}{
+						"reason":             "preauth_short_conn",
+						"short_conn_seconds": cfg.Ban.ShortConnSeconds,
+						"threshold":          cfg.Ban.Threshold,
+						"window_minutes":     cfg.Ban.WindowMinutes,
+					})
+				}
+			default:
+				eventLogger.Event("warning", map[string]interface{}{
+					"message": fmt.Sprintf("unknown event type %d", event.Type),
 				})
 			}
-		default:
-			eventLogger.Event("warning", map[string]interface{}{
-				"message": fmt.Sprintf("unknown event type %d", event.Type),
-			})
 		}
 	}
 }
