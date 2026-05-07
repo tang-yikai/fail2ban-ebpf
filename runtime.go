@@ -9,6 +9,7 @@ import (
 )
 
 type Runtime struct {
+	objs       *sshmonObjects
 	reader     *perf.Reader
 	kpAccept   link.Link
 	tpFork     link.Link
@@ -20,6 +21,9 @@ type Runtime struct {
 func (r *Runtime) Close() error {
 	var closeErr error
 
+	if r.objs != nil {
+		closeErr = errors.Join(closeErr, r.objs.Close())
+	}
 	if r.reader != nil {
 		closeErr = errors.Join(closeErr, r.reader.Close())
 	}

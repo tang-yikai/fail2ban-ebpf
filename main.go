@@ -61,98 +61,11 @@ func main() {
 	}
 	defer eventLogger.Close()
 
-	banFilter, err := NewBanFilter(cfg)
+	rt, rd, libPath, banFilter, banManager, xdpBlocker, err := initResources(cfg, &objs)
 	if err != nil {
-		_ = eventLogger.Close()
-		fatalf("create ban filter: %v", err)
+		fatalf("init: %v", err)
 	}
-
-	xdpBlocker, err := NewXDPBlocker(cfg)
-	if err != nil {
-		_ = eventLogger.Close()
-		fatalf("attach xdp: %v", err)
-	}
-
-	banManager := NewBanManager(cfg)
-
-	port := cfg.SSH.Port
-	var enabled uint8 = 1
-	if err := objs.MonitoredPorts.Update(port, enabled, 0); err != nil {
-		_ = xdpBlocker.Close()
-		_ = eventLogger.Close()
-		fatalf("failed to update port map: %v", err)
-	}
-
-	kpAccept, err := attachAcceptProbe(&objs)
-	if err != nil {
-		_ = xdpBlocker.Close()
-		_ = eventLogger.Close()
-		fatalf("failed to attach accept probe: %v", err)
-	}
-
-	tpFork, err := link.Tracepoint("sched", "sched_process_fork", objs.HandleFork, nil)
-	if err != nil {
-		_ = kpAccept.Close()
-		_ = xdpBlocker.Close()
-		_ = eventLogger.Close()
-		fatalf("failed to attach sched_process_fork: %v", err)
-	}
-
-	tpExit, err := link.Tracepoint("sched", "sched_process_exit", objs.HandleExit, nil)
-	if err != nil {
-		_ = tpFork.Close()
-		_ = kpAccept.Close()
-		_ = xdpBlocker.Close()
-		_ = eventLogger.Close()
-		fatalf("failed to attach sched_process_exit: %v", err)
-	}
-
-	libPath := findLibPAM()
-	if err := ensureExecutable(libPath); err != nil {
-		eventLogger.Event("warning", map[string]interface{}{
-			"message": fmt.Sprintf("could not ensure executable bit on %s: %v", libPath, err),
-		})
-	}
-
-	ex, err := link.OpenExecutable(libPath)
-	if err != nil {
-		_ = tpExit.Close()
-		_ = tpFork.Close()
-		_ = kpAccept.Close()
-		_ = xdpBlocker.Close()
-		_ = eventLogger.Close()
-		fatalf("open libpam: %v", err)
-	}
-
-	up, err := ex.Uretprobe("pam_authenticate", objs.HandlePamAuth, nil)
-	if err != nil {
-		_ = tpExit.Close()
-		_ = tpFork.Close()
-		_ = kpAccept.Close()
-		_ = xdpBlocker.Close()
-		_ = eventLogger.Close()
-		fatalf("attach uretprobe: %v", err)
-	}
-
-	rd, err := perf.NewReader(objs.Events, os.Getpagesize()*64)
-	if err != nil {
-		_ = up.Close()
-		_ = tpExit.Close()
-		_ = tpFork.Close()
-		_ = kpAccept.Close()
-		_ = xdpBlocker.Close()
-		_ = eventLogger.Close()
-		fatalf("create perf reader: %v", err)
-	}
-
-	rt := &Runtime{
-		reader:     rd,
-		kpAccept:   kpAccept,
-		tpFork:     tpFork,
-		tpExit:     tpExit,
-		pamProbe:   up,
-		xdpBlocker: xdpBlocker,
-	}
+	defer rt.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -163,7 +76,7 @@ func main() {
 		"log_file":           cfg.Log.File,
 		"mode":               cfg.Mode,
 		"short_conn_seconds": cfg.Ban.ShortConnSeconds,
-		"ssh_port":           port,
+		"ssh_port":           cfg.SSH.Port,
 		"threshold":          cfg.Ban.Threshold,
 		"window_minutes":     cfg.Ban.WindowMinutes,
 		"xdp_iface":          cfg.XDP.Iface,
@@ -188,18 +101,105 @@ func main() {
 		"signal": ctx.Err().Error(),
 	})
 
-	if err := rd.Close(); err != nil && !isClosedPerfError(err) {
-		eventLogger.Event("warning", map[string]interface{}{
-			"message": fmt.Sprintf("close perf reader: %v", err),
-		})
-	}
-
 	wg.Wait()
 	eventLogger.Event("service_stopped", map[string]interface{}{})
 
 	if err := rt.Close(); err != nil && !isClosedPerfError(err) {
 		fatalf("shutdown resources: %v", err)
 	}
+}
+
+// initResources 初始化所有 BPF 探针、XDP 和 perf reader。
+// 使用 closers + defer 统一清理，错误时自动按 LIFO 顺序释放已创建的资源。
+func initResources(cfg Config, objs *sshmonObjects) (
+	rt *Runtime,
+	rd *perf.Reader,
+	libPath string,
+	banFilter *BanFilter,
+	banManager *BanManager,
+	xdpBlocker *XDPBlocker,
+	err error,
+) {
+	var closers []func()
+	defer func() {
+		if err != nil {
+			for i := len(closers) - 1; i >= 0; i-- {
+				closers[i]()
+			}
+		}
+	}()
+
+	banFilter, err = NewBanFilter(cfg)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("create ban filter: %w", err)
+	}
+
+	xdpBlocker, err = NewXDPBlocker(cfg)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("attach xdp: %w", err)
+	}
+	closers = append(closers, func() { _ = xdpBlocker.Close() })
+
+	banManager = NewBanManager(cfg)
+
+	port := cfg.SSH.Port
+	var enabled uint8 = 1
+	if err = objs.MonitoredPorts.Update(port, enabled, 0); err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("update port map: %w", err)
+	}
+
+	kpAccept, err := attachAcceptProbe(objs)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("attach accept probe: %w", err)
+	}
+	closers = append(closers, func() { _ = kpAccept.Close() })
+
+	tpFork, err := link.Tracepoint("sched", "sched_process_fork", objs.HandleFork, nil)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("attach sched_process_fork: %w", err)
+	}
+	closers = append(closers, func() { _ = tpFork.Close() })
+
+	tpExit, err := link.Tracepoint("sched", "sched_process_exit", objs.HandleExit, nil)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("attach sched_process_exit: %w", err)
+	}
+	closers = append(closers, func() { _ = tpExit.Close() })
+
+	libPath = findLibPAM()
+	if err := ensureExecutable(libPath); err != nil {
+		eventLogger.Event("warning", map[string]interface{}{
+			"message": fmt.Sprintf("could not ensure executable bit on %s: %v", libPath, err),
+		})
+	}
+
+	ex, err := link.OpenExecutable(libPath)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("open libpam: %w", err)
+	}
+
+	up, err := ex.Uretprobe("pam_authenticate", objs.HandlePamAuth, nil)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("attach uretprobe: %w", err)
+	}
+	closers = append(closers, func() { _ = up.Close() })
+
+	rd, err = perf.NewReader(objs.Events, os.Getpagesize()*64)
+	if err != nil {
+		return nil, nil, "", nil, nil, nil, fmt.Errorf("create perf reader: %w", err)
+	}
+	closers = append(closers, func() { _ = rd.Close() })
+
+	rt = &Runtime{
+		objs:       objs,
+		reader:     rd,
+		kpAccept:   kpAccept,
+		tpFork:     tpFork,
+		tpExit:     tpExit,
+		pamProbe:   up,
+		xdpBlocker: xdpBlocker,
+	}
+	return rt, rd, libPath, banFilter, banManager, xdpBlocker, nil
 }
 
 // findLibPAM 自动适配架构并动态查找 libpam 路径
