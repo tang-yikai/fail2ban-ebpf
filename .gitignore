@@ -5,4 +5,3 @@ fail2ban-ebpf
 sshmon_x86_bpfel.go
 xdp_x86_bpfel.go
 .cnb.yml
-test.md
